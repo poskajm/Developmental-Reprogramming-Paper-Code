@@ -1,0 +1,417 @@
+---
+title: "Multiome Processing and Clustering"
+author: "Jillian Poska"
+date: "2026-06-04"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Libraries
+```{r}
+library(hdf5r)
+library(Signac)
+library(Seurat)
+library(SeuratObject)
+library(tidyverse)
+library(dplyr)
+library(umap)
+library(glmGamPoi)
+
+library(SingleCellExperiment)
+library(SeuratWrappers)
+library(SoupX)
+
+
+setwd("~/Multiome2")
+set.seed(228)
+```
+
+## Process and normalize each sample individually
+SoupX works best with some kind of clustering information already provided. I processed each sample individually to obtain the clustering information to run SoupX. This gave me a rough idea, but I reclustered my data later on, so don't worry if it's not perfect.
+```{r}
+# Load data
+BPA.counts <- Read10X_h5("~/Multiome2/BPA Adult/filtered_feature_bc_matrix.h5")
+BPA.fragments <- "~/Multiome2/BPA Adult/atac_fragments.tsv.gz"
+oil.counts <- Read10X_h5("~/Multiome2/Veh Adult/filtered_feature_bc_matrix.h5")
+oil.fragments <- "~/Multiome2/Veh Adult/atac_fragments.tsv.gz"
+
+# Create Seurat object using RNA counts
+BPA <- CreateSeuratObject(
+  counts = BPA.counts$`Gene Expression`,
+  assay = "RNA"
+)
+oil <- CreateSeuratObject(
+  counts = oil.counts$`Gene Expression`,
+  assay = "RNA"
+)
+
+library(EnsDb.Mmusculus.v79)
+# get gene annotations from mm10
+annotations <- GetGRangesFromEnsDb(ensdb = EnsDb.Mmusculus.v79)
+seqlevels(annotations) <- paste0('chr',seqlevels(annotations))
+
+# create ATAC assay and add to the Seurat object
+BPA[["ATAC"]] <- CreateChromatinAssay(
+  counts = BPA.counts$Peaks,
+  sep = c(":","-"),
+  fragments = BPA.fragments,
+  annotation = annotations
+)
+
+oil[["ATAC"]] <- CreateChromatinAssay(
+  counts = oil.counts$Peaks,
+  sep = c(":","-"),
+  fragments = oil.fragments,
+  annotation = annotations
+)
+
+# Normalize and cluster each sample
+# BPA
+DefaultAssay(BPA) <- "RNA"
+
+BPA <- BPA %>%
+  NormalizeData() %>%
+  FindVariableFeatures() %>%
+  ScaleData() %>%
+  RunPCA() %>%
+  RunUMAP(dims = 1:20, reduction.name = 'umap.rna', reduction.key = 'rnaUMAP_')
+
+DefaultAssay(BPA) <- "ATAC"
+BPA <- BPA %>%
+  RunTFIDF() %>%
+  FindTopFeatures(min.cutoff = 'q0') %>%
+  RunSVD() %>%
+  RunUMAP(reduction = "lsi", dims = 2:50, reduction.name = "umap.atac", reduction.key = "atacUMAP_")
+
+BPA <- FindMultiModalNeighbors(BPA, reduction.list = list("pca", "lsi"), dims.list = list(1:20, 2:50))
+BPA <- RunUMAP(BPA, nn.name = "weighted.nn", reduction.name = "wnn.umap", reduction.key = "wnnUMAP_")
+BPA <- FindClusters(BPA, graph.name = "wsnn", algorithm = 3, verbose = FALSE, resolution = 0.2)
+
+# oil
+DefaultAssay(oil) <- "RNA"
+
+oil <- oil %>%
+  NormalizeData() %>%
+  FindVariableFeatures() %>%
+  ScaleData() %>%
+  RunPCA() %>%
+  RunUMAP(dims = 1:20, reduction.name = 'umap.rna', reduction.key = 'rnaUMAP_')
+
+DefaultAssay(oil) <- "ATAC"
+oil <- oil %>%
+  RunTFIDF() %>%
+  FindTopFeatures(min.cutoff = 'q0') %>%
+  RunSVD() %>%
+  RunUMAP(reduction = "lsi", dims = 2:50, reduction.name = "umap.atac", reduction.key = "atacUMAP_")
+
+oil <- FindMultiModalNeighbors(oil, reduction.list = list("pca", "lsi"), dims.list = list(1:20, 2:50))
+oil <- RunUMAP(oil, nn.name = "weighted.nn", reduction.name = "wnn.umap", reduction.key = "wnnUMAP_")
+oil <- FindClusters(oil, graph.name = "wsnn", algorithm = 3, verbose = FALSE, resolution = 0.2)
+
+# Save metadata
+BPA_metadata <- BPA@meta.data
+BPA_umap <- BPA@reductions$wnn.umap
+BPA_embeddings <- BPA_umap@cell.embeddings
+remove(BPA_umap)
+
+oil_metadata <- oil@meta.data
+oil_umap <- oil@reductions$wnn.umap
+oil_embeddings <- oil_umap@cell.embeddings
+remove(oil_umap)
+
+remove(BPA, oil)
+```
+
+## Run SoupX analysis to remove ambient RNA contamination
+```{r}
+# Upload raw feature matrices for each sample and make a soup channel
+BPA.toc <- BPA.counts$`Gene Expression`
+BPA.tod <- Read10X_h5("BPA Adult/raw_feature_bc_matrix.h5")
+BPA.tod <- BPA.tod$`Gene Expression`
+BPA.sc <- SoupChannel(toc = BPA.toc, tod = BPA.tod)
+
+oil.toc <- oil.counts$`Gene Expression`
+oil.tod <- Read10X_h5("Veh Adult/raw_feature_bc_matrix.h5")
+oil.tod <- oil.tod$`Gene Expression`
+oil.sc <- SoupChannel(toc = oil.toc, tod = oil.tod)
+
+remove(BPA.toc, BPA.tod, oil.toc, oil.tod)
+
+# Enter clustering information and embeddings into the soup channel
+BPA.sc <- setClusters(BPA.sc, setNames(BPA_metadata$seurat_clusters, rownames(BPA_metadata)))
+BPA.sc <- setDR(BPA.sc, BPA_embeddings[colnames(BPA.sc$toc), c("wnnUMAP_1", "wnnUMAP_2")])
+
+oil.sc <- setClusters(oil.sc, setNames(oil_metadata$seurat_clusters, rownames(oil_metadata)))
+oil.sc <- setDR(oil.sc, oil_embeddings[colnames(oil.sc$toc), c("wnnUMAP_1", "wnnUMAP_2")])
+remove(BPA_metadata, BPA_embeddings, oil_metadata, oil_embeddings)
+
+# Set contamination fraction - based on auto estimates and using top soup genes to estimate
+BPA.sc <- setContaminationFraction(BPA.sc, 0.2)
+oil.sc <- setContaminationFraction(oil.sc, 0.05)
+
+# Correct expression levels
+BPA.out <- adjustCounts(BPA.sc)
+oil.out <- adjustCounts(oil.sc)
+
+# Make a Seurat object with the corrected RNA counts
+BPA <- CreateSeuratObject(BPA.out,
+                          assay = "RNA")
+
+oil <- CreateSeuratObject(oil.out,
+                          assay = "RNA")
+remove(oil.sc, oil.out, BPA.sc, BPA.out)
+```
+
+## Add ATAC data to Seurat object
+```{r}
+bpa.atac <- BPA.counts$Peaks
+oil.atac <- oil.counts$Peaks
+
+# Limit analysis to only standard chromosomes
+bpa.atac.grange <- StringToGRanges(rownames(bpa.atac), sep = c(":", "-"))
+bpa.grange.use <- seqnames(bpa.atac.grange) %in% standardChromosomes(bpa.atac.grange)
+bpa.atac <- bpa.atac[as.vector(bpa.grange.use), ]
+
+oil.atac.grange <- StringToGRanges(rownames(oil.atac), sep = c(":", "-"))
+oil.grange.use <- seqnames(oil.atac.grange) %in% standardChromosomes(oil.atac.grange)
+oil.atac <- oil.atac[as.vector(oil.grange.use), ]
+
+# create ATAC assay and add to the Seurat object
+BPA[["ATAC"]] <- CreateChromatinAssay(
+  counts = bpa.atac,
+  sep = c(":","-"),
+  fragments = BPA.fragments,
+  annotation = annotations,
+  genome = "mm10"
+)
+
+oil[["ATAC"]] <- CreateChromatinAssay(
+  counts = oil.atac,
+  sep = c(":","-"),
+  fragments = oil.fragments,
+  annotation = annotations,
+  genome = "mm10"
+)
+
+remove(BPA.counts, oil.counts, BPA.fragments, oil.fragments, annotations, bpa.atac.grange, bpa.atac, bpa.grange.use, oil.atac, oil.atac.grange, oil.grange.use)
+```
+
+## QC data
+```{r}
+# set default assay to ATAC and calculate QC parameters
+DefaultAssay(BPA) <- "ATAC"
+
+BPA <- NucleosomeSignal(BPA)
+BPA <- TSSEnrichment(BPA)
+
+DefaultAssay(oil) <- "ATAC"
+
+oil <- NucleosomeSignal(oil)
+oil <- TSSEnrichment(oil)
+
+# check QC metrics for ATAC
+DensityScatter(BPA, x = "nCount_ATAC", y = "TSS.enrichment", log_x = TRUE, quantiles = TRUE)
+
+VlnPlot(
+  object = BPA,
+  features = c( "nCount_ATAC", "TSS.enrichment", "nucleosome_signal"),
+  ncol = 4,
+  pt.size = 0
+)
+
+DensityScatter(oil, x = "nCount_ATAC", y = "TSS.enrichment", log_x = TRUE, quantiles = TRUE)
+
+VlnPlot(
+  object = oil,
+  features = c( "nCount_ATAC", "TSS.enrichment", "nucleosome_signal"),
+  ncol = 4,
+  pt.size = 0
+)
+
+# calculate QC metrics for RNA
+DefaultAssay(BPA) <- "RNA"
+# Soup genes as determined from the SoupProfile
+soup.genes <- c("Csn2", "Csn1s2a", "Glycam1", "Tpt1", "Csn3", "Spp1", "Camk1d", "Wap", "Fabp4", "AY036118")
+
+BPA[["percent.soup"]] <- PercentageFeatureSet(BPA, features = soup.genes)
+BPA[["percent.mt"]] <- PercentageFeatureSet(BPA, pattern = "^mt-")
+
+VlnPlot(BPA, features = c("percent.mt", "nCount_RNA", "percent.soup"), ncol = 4, pt.size = 0)
+
+DefaultAssay(oil) <- "RNA"
+
+oil[["percent.mt"]] <- PercentageFeatureSet(oil, pattern = "^mt-")
+
+VlnPlot(oil, features = c("percent.mt", "nCount_RNA"), ncol = 3, pt.size = 0)
+
+# subset data to exclude cells failing QC metrics
+BPA <- subset(
+  x = BPA,
+  subset = nCount_ATAC < 50000 &
+    nCount_RNA < 20000 &
+    nCount_ATAC > 2000 &
+    nCount_RNA > 1200 &
+    nucleosome_signal < 2 &
+    TSS.enrichment > 4 &
+    percent.mt < 20 &
+    percent.soup < 5
+)
+
+oil <- subset(
+  x = oil,
+  subset = nCount_ATAC < 50000 &
+    nCount_RNA < 20000 &
+    nCount_ATAC > 1000 &
+    nCount_RNA > 1000 &
+    nucleosome_signal < 2 &
+    TSS.enrichment > 3 &
+    percent.mt < 20
+)
+
+remove(BPA.dc.sobj, oil.dc.sobj)
+```
+
+## Merge data
+Credit to the QuadBio multiome vignette for the code for creating a union peak list
+```{r}
+BPA@meta.data$treatment <- "BPA"
+oil@meta.data$treatment <- "Vehicle"
+
+# merge datasets
+adult <- merge(
+  x = BPA,
+  y = oil,
+  add.cell.ids = c("BPA", "oil")
+)
+
+# create a union peak list 
+peaks <- GenomicRanges::reduce(unlist(as(c(BPA@assays$ATAC@ranges,
+                                           oil@assays$ATAC@ranges),
+                                         "GRangesList")))
+
+peakwidths <- width(peaks)
+peaks <- peaks[peakwidths < 10000 & peakwidths > 20]
+
+counts_atac_merged <- FeatureMatrix(adult@assays$ATAC@fragments,
+                                    features = peaks,
+                                    cells = colnames(adult))
+
+# add peak list to merged Seurat
+adult[['ATAC']] <- CreateChromatinAssay(counts_atac_merged,
+                                               fragments = adult@assays$ATAC@fragments,
+                                               annotation = adult@assays$ATAC@annotation,
+                                               sep = c(":","-"))
+
+remove(BPA, oil)
+
+```
+
+## Processing data
+```{r}
+DefaultAssay(adult) <- "RNA"
+
+adult <- adult %>%
+  NormalizeData() %>%
+  FindVariableFeatures() %>%
+  ScaleData() %>%
+  RunPCA() %>%
+  RunUMAP(dims = 1:50, reduction.name = 'umap.rna', reduction.key = 'rnaUMAP_')
+
+adult <- IntegrateLayers(object = adult, 
+    method = HarmonyIntegration,
+    orig.reduction = "pca", 
+    new.reduction = "integrated.harmony",
+    verbose = TRUE)
+
+DefaultAssay(adult) <- "ATAC"
+adult <- RunTFIDF(adult)
+adult <- FindTopFeatures(adult, min.cutoff = 'q0')
+adult <- RunSVD(adult)
+adult <- RunUMAP(adult, reduction = 'lsi', dims = 2:50, reduction.name = "umap.atac", reduction.key = "atacUMAP_")
+
+integration.anchors <- FindIntegrationAnchors(
+  object.list = SplitObject(adult, "treatment"),
+  anchor.features = rownames(adult),
+  reduction = "rlsi",
+  dims = 2:50
+)
+ 
+adult_integrated <- IntegrateEmbeddings(
+  anchorset = integration.anchors,
+  reductions = adult[["lsi"]],
+  new.reduction.name = "integrated.lsi",
+  dims.to.integrate = 1:50
+)
+
+adult[['integrated_lsi_atac']] <- CreateDimReducObject(
+  Embeddings(adult_integrated, "integrated.lsi")[colnames(adult),], key = "INTEGRATEDLSI_", assay = "ATAC"
+)
+remove(integration.anchors, adult_integrated)
+```
+
+## Clustering
+```{r}
+adult <- FindMultiModalNeighbors(adult, reduction.list = list("integrated.harmony", "integrated_lsi_atac"), dims.list = list(1:50, 2:50))
+adult <- RunUMAP(adult, nn.name = "weighted.nn", reduction.name = "wnn.umap", reduction.key = "wnnUMAP_")
+adult <- FindClusters(adult, graph.name = "wsnn", algorithm = 3, verbose = FALSE, resolution = 0.2)
+
+DefaultAssay(adult) <- "RNA"
+adult[["RNA"]] <- JoinLayers(adult[["RNA"]])
+rna_markers <- FindAllMarkers(object = adult,
+                          min.pct = 0.3,
+                          only.pos = T,
+                          logfc.threshold = 0.3)
+rna_markers <- rna_markers[rna_markers$p_val_adj < 0.05, ]
+
+# Supplemental Figure 
+DotPlot(adult, features = c("Epcam", "Elf5", "Wnt5b", "Esr1", "Cited1", "Krt14", "Acta2", "Lgr5", "Pdgfra", "Col1a1", "Pi16", "Rgs5", "Notch3", "Pecam1", "Cdh5", "Prox1", "Mmrn1", "Ptprc", "Csf1r", "F13a1", "Cd3d", "Cd3e", "Cd3g", "Cd79a", "Cd79b"))
+```
+
+## Check if there is any difference between separate cell type clusters
+```{r}
+DefaultAssay(adult) <- "RNA"
+basal.de.markers <- FindMarkers(adult, ident.1 = "Basal 1", ident.2 = "Basal 2")
+basal1.markers <- basal.de.markers[basal.de.markers$avg_log2FC > 0.5, ]
+basal2.markers <- basal.de.markers[basal.de.markers$avg_log2FC < -0.5, ]
+
+tcell.de.markers <- FindMarkers(adult, ident.1 = "T cell 1", ident.2 = "T cell 2")
+tcell1.markers <- tcell.de.markers[tcell.de.markers$avg_log2FC > 0.5, ]
+tcell2.markers <- tcell.de.markers[tcell.de.markers$avg_log2FC < - 0.5, ]
+
+le.de.markers <- FindMarkers(adult, ident.1 = "Lymphatic Endothelial 1", ident.2 = "Lymphatic Endothelial 2")
+le1.markers <- le.de.markers[le.de.markers$avg_log2FC > 0.5, ]
+le2.markers <- le.de.markers[le.de.markers$avg_log2FC < -0.5, ]
+
+ve.de.markers <- FindMarkers(adult, ident.1 = "Vascular Endothelial 1", ident.2 = "Vascular Endothelial 2")
+ve1.markers <- ve.de.markers[ve.de.markers$avg_log2FC > 0.5, ]
+ve2.markers <- ve.de.markers[ve.de.markers$avg_log2FC < -0.5, ]
+```
+
+
+## Rename clusters based on RNA markers
+```{r}
+Idents(adult) <- "seurat_clusters"
+adult <- RenameIdents(object = adult, '0' = "Mature Luminal")
+adult <- RenameIdents(object = adult, '1' = "Vascular Endothelial 1")
+adult <- RenameIdents(object = adult, '2' = "Basal 1")
+adult <- RenameIdents(object = adult, '3' = "Fibroblast 1")
+adult <- RenameIdents(object = adult, '4' = "Luminal Progenitor")
+adult <- RenameIdents(object = adult, '5' = "Macrophage 1")
+adult <- RenameIdents(object = adult, '6' = "Fibroblast 2")
+adult <- RenameIdents(object = adult, '7' = "Basal 2")
+adult <- RenameIdents(object = adult, '8' = "Vascular Endothelial 2")
+adult <- RenameIdents(object = adult, '9' = "T cell 1")
+adult <- RenameIdents(object = adult, '10' = "Lymphatic Endothelial 1")
+adult <- RenameIdents(object = adult, '11' = "Pericyte")
+adult <- RenameIdents(object = adult, '12' = "Macrophage 2")
+adult <- RenameIdents(object = adult, '13' = "T cell 2")
+adult <- RenameIdents(object = adult, '14' = "Lymphatic Endothelial 2")
+adult <- RenameIdents(object = adult, '15' = "B cell")
+adult <- RenameIdents(object = adult, '16' = "Fibroblast 3")
+
+
+adult$celltype <- adult@active.ident
+```
