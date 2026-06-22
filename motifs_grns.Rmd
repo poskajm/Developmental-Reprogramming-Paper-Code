@@ -1,0 +1,207 @@
+---
+title: "Motif and GRN analysis"
+author: "Jillian Poska"
+date: "2026-06-22"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Load required libraries
+```{r}
+library(hdf5r)
+library(Signac)
+library(Seurat)
+library(SeuratObject)
+library(tidyverse)
+library(dplyr)
+library(umap)
+library(glmGamPoi)
+library(rtracklayer)
+library(clusterProfiler)
+library(monocle3)
+library(SeuratWrappers)
+library(chromVAR)
+library(chromVARmotifs)
+library(JASPAR2020)
+library(TFBSTools)
+library(motifmatchr)
+library(BSgenome.Mmusculus.UCSC.mm10)
+library(presto)
+library(cicero)
+
+setwd("~/Multiome2/")
+set.seed(228)
+```
+
+## ChromVAR analysis
+```{r}
+# Run ChromVAR
+DefaultAssay(adult.fibro) <- "ATAC"
+
+grange <- StringToGRanges(rownames(adult.fibro@assays$ATAC), sep = c(":", "-"))
+
+motif.matrix <- CreateMotifMatrix(features = grange, pwm = mouse_pwms_v2, genome = "mm10", use.counts = FALSE)
+motif.object <- CreateMotifObject(data = motif.matrix, pwm = mouse_pwms_v2)
+adult.fibro <- SetAssayData(adult.fibro, assay = "ATAC", layer = "motifs", new.data = motif.object)
+remove(grange, motif.matrix, motif.object)
+
+adult <- RunChromVAR(
+  object = adult,
+  genome = BSgenome.Mmusculus.UCSC.mm10,
+  assay = "ATAC"
+)
+
+# Determine which motifs mark which cell types
+DefaultAssay(adult.fibro) <- "chromvar"
+adult_motifs <- FindAllMarkers(adult.fibro,
+               min.pct = 0.3,
+               only.pos = T)
+
+# Determine differential motif accessibility
+DefaultAssay(adult.fibro) <- "chromvar"
+df <- table(adult.fibro@active.ident, adult.fibro$treatment) %>%
+  as.data.frame() %>%
+  pivot_wider(names_from = Var2,
+              values_from = Freq) %>%
+  as.data.frame()
+
+clusters <- df[df$Vehicle >= 3 & df$BPA >= 3, "Var1"] %>%
+  as.character()
+
+diff_motifs <- list()
+for (cell in clusters){
+  markers <- FindMarkers(object = adult.fibro,
+                         ident.1 = "Vehicle",
+                         ident.2 = "BPA",
+                         group.by = "treatment",
+                         subset.ident = cell,
+                         min.pct = 0.1)
+  filtered_markers <- markers[markers$p_val_adj < 0.05, ]
+  filtered_markers$gene <- rownames(filtered_markers)
+  diff_motifs[[cell]] <- filtered_markers
+}
+
+motifs <- rbindlist(diff_motifs, idcol = TRUE)
+write.csv(motifs, file = "DiffMotifs.csv")
+
+saveRDS(adult, file = "RDS/Adult/adult_fibro_chromvar.rds")
+
+# Feature plot motifs of interest - Figure 7E
+FeaturePlot(adult.fibro, reduction = "wnn.umap", features = c("ENSMUSG00000052684-LINE240-Jun-D", "ENSMUSG00000019768-LINE1592-Esr1-D"), split.by = "treatment", cols = BlueAndRed(50))
+```
+
+## GRN analysis with Pando
+```{r}
+# Initialize a Pando-compatible Seurat object; used all called peaks 
+DefaultAssay(adult.fibro) <- "ATAC"
+
+peaks <- adult.fibro@assays$ATAC@ranges
+
+fib.grn <- initiate_grn(adult.fibro,
+                        rna_assay = "RNA", peak_assay = "ATAC",
+                        regions = peaks)
+
+# Incorporate motifs into the GRN object
+# Mutate mouse pwm list - Pando needs a pfm list and a table of motifs matched with their corresponding TFs
+data("mouse_pwms_v2")
+x <- character()
+for(i in 1:length(mouse_pwms_v2@listData)){
+  x[i] <- mouse_pwms_v2@listData[[i]]@name
+}
+
+motiftf <- data.frame(motif = names(mouse_pwms_v2@listData), tf = x, origin = "CIS-BP", gene_id = gsub("_[[:alnum:][:punct:]]*", "", names(mouse_pwms_v2@listData)), family = NA, name = NA, symbol = NA, motif_tf = NA) %>%
+subset(gene_id != "XP" & gene_id != "NP")
+
+mouse_pwms_v3 <- subset(mouse_pwms_v2, names(mouse_pwms_v2@listData) %in% motiftf$motif)
+
+# Add motifs to GRN object
+fib.grn <- find_motifs(fib.grn,
+                       pfm = mouse_pwms_v3,
+                       motif_tfs = motiftf,
+                       genome = BSgenome.Mmusculus.UCSC.mm10)
+
+remove(x, i, mouse_pwms_v3, mouse_pwms_v2, motiftf)
+
+# Infer the GRN using genes involved in fibroblast cell type identity 
+DefaultAssay(adult.fibro) <- "RNA"
+rna_markers <- FindAllMarkers(object = adult.fibro,
+                          min.pct = 0.3,
+                          only.pos = T,
+                          logfc.threshold = 0.5)
+rna_markers <- rna_markers[rna_markers$p_val_adj < 0.05, ]
+genes <- rna_markers$gene
+# Remove genes starting with numbers - Pando will not read these properly
+filtered <- genes[!grepl("^[0-9]", genes)]
+
+fib.grn <- infer_grn(fib.grn,
+                     tf_cor = 0.05,
+                     method = "glm",
+                     family = "gaussian",
+                     scale = F,
+                     verbose = T,
+                     peak_to_gene_method = 'Signac',
+                     genes = filtered)
+
+# Find regulatory modules
+fib.grn <- find_modules(
+  fib.grn,
+  p_thresh = 0.05,
+  nvar_thresh = 10,
+  min_genes_per_module = 1,
+  rsq_thresh = 0.1
+)
+
+# Define regulons
+regulons <- NetworkModules(fib.grn)
+
+positive_regulons <- regulons@features[['genes_pos']]
+positive_regulons <- positive_regulons[lengths(positive_regulons) > 5]
+negative_regulons <- regulons@features[['genes_neg']]
+negative_regulons <- negative_regulons[lengths(negative_regulons) > 4]
+
+DefaultAssay(adult.fibro) <- "RNA"
+
+# Make module scores for each regulon
+mod_act_pos <- AddModuleScore(adult.fibro, features = positive_regulons, name = "regulon_")@meta.data
+mod_act_pos <- mod_act_pos[,grep("^regulon_", colnames(mod_act_pos))] %>%
+  setNames(paste0(names(positive_regulons),"(+)"))
+
+mod_act_neg <- AddModuleScore(adult.fibro, features = negative_regulons, name = "regulon_")@meta.data
+mod_act_neg <- mod_act_neg[,grep("^regulon_", colnames(mod_act_neg))] %>%
+  setNames(paste0(names(negative_regulons),"(-)"))
+
+# Make a new assay called regulon and add regulons
+adult.fibro[["regulon"]] <- CreateAssayObject(data = t(cbind(mod_act_pos, mod_act_neg)))
+
+# Find differences in regulons between treatments
+DefaultAssay(adult.fibro) <- "regulon"
+df <- table(adult.fibro@active.ident, adult.fibro$treatment) %>%
+  as.data.frame() %>%
+  pivot_wider(names_from = Var2,
+              values_from = Freq) %>%
+  as.data.frame()
+
+clusters <- df[df$Vehicle >= 3 & df$BPA >= 3, "Var1"] %>%
+  as.character()
+
+markers_list <- list()
+for (cell in clusters){
+  markers <- FindMarkers(object = adult.fibro,
+                         ident.1 = "Vehicle",
+                         ident.2 = "BPA",
+                         group.by = "treatment",
+                         subset.ident = cell,
+                         min.pct = 0.1)
+  filtered_markers <- markers[markers$p_val_adj < 0.05, ]
+  filtered_markers$gene <- rownames(filtered_markers)
+  markers_list[[cell]] <- filtered_markers
+}
+diff_regulons <- rbindlist(markers_list, idcol = TRUE)
+
+# Feature plot regulons of interest - Figure 7F
+FeaturePlot(adult.fibro, reduction = "wnn.umap", features = c("Esr1(+)", "Jund(+)"), split.by = "treatment", cols = BlueAndRed(50))
+```
+

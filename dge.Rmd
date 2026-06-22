@@ -1,0 +1,170 @@
+---
+title: "Differential Gene Expression"
+author: "Jillian Poska"
+date: "2026-06-22"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Load required libraries
+```{r}
+library(hdf5r)
+library(Signac)
+library(Seurat)
+library(SeuratObject)
+library(tidyverse)
+library(dplyr)
+library(umap)
+library(glmGamPoi)
+library(rio)
+
+setwd("~/Multiome2")
+set.seed(228)
+```
+
+## Determine the cell percentages in each cluster
+```{r}
+# with vascular cells - supplemental figure
+df <- table(adult@active.ident, adult$treatment) %>%
+  as.data.frame() 
+
+df$Var2 <- factor(df$Var2, levels = c("Vehicle", "BPA"))
+
+myplot<- ggplot(data = df, aes(fill = Var1, y = Freq, x = Var2)) +
+  geom_bar(stat = "identity", position = "fill", color = "black") 
+
+myplot +
+  theme(panel.grid = element_line("white"),
+        panel.background = element_rect("white"),
+        axis.line = element_line("black", linewidth = 0.75),
+        axis.text.x.bottom = element_text(size = 12),
+        axis.text.y.left = element_text(size = 12),
+        axis.title.x = element_text(size = 14, face = "bold"),
+        axis.title.y.left = element_text(size = 14, face = "bold")) +
+  labs(x = "Treatment", y = "% cells", fill = "Cluster")
+
+# without vascular cells - Figure 5B
+adult.novasc <- subset(x = adult, idents = c("Macrophage 2", "Pericyte", "T cell 1", "T cell 2", "Basal 1", "Basal 2", "Fibroblast 1", "Macrophage 1", "Luminal Progenitor", "Fibroblast 2", "Fibroblast 3", "Mature Luminal", "B cell"))
+
+df.noendo <- table(adult.novasc@active.ident, adult.novasc$treatment) %>%
+  as.data.frame()
+df.noendo$Var2 <- factor(df.noendo$Var2, levels = c("Vehicle", "BPA"))
+noendoplot <- ggplot(data = df.noendo, aes(fill = Var1, y = Freq, x = Var2)) +
+  geom_bar(stat = "identity", position = "fill", color = "black") 
+
+noendoplot + 
+  theme(panel.grid = element_line("white"),
+        panel.background = element_rect("white"),
+        axis.line = element_line("black", linewidth = 0.75),
+        axis.text.x.bottom = element_text(size = 12),
+        axis.text.y.left = element_text(size = 12),
+        axis.title.x = element_text(size = 14, face = "bold"),
+        axis.title.y.left = element_text(size = 14, face = "bold")) +
+  labs(x = "Treatment", y = "% cells", fill = "Cluster")
+
+## Plot Ki67 and Esr1 expression
+FeaturePlot(adult, reduction = "wnn.umap", features = c("Mki67", "Esr1"), split.by = "treatment")
+```
+
+## Differential gene expression in individual cell populations
+```{r}
+DefaultAssay(adult) <- "RNA"
+df <- table(adult@active.ident, adult$treatment) %>%
+  as.data.frame() %>%
+  pivot_wider(names_from = Var2,
+              values_from = Freq) %>%
+  as.data.frame()
+
+clusters <- df[df$Vehicle >= 3 & df$BPA >= 3, "Var1"] %>%
+  as.character()
+
+markers_list <- list()
+for (cell in clusters){
+  markers <- FindMarkers(object = adult,
+                         ident.1 = "Vehicle",
+                         ident.2 = "BPA",
+                         group.by = "treatment",
+                         subset.ident = cell,
+                         min.pct = 0.1)
+  filtered_markers <- markers[markers$p_val_adj < 0.05, ]
+  filtered_markers$gene <- rownames(filtered_markers)
+  markers_list[[cell]] <- filtered_markers
+}
+
+
+# filter DEGs by appearance in ambient RNA
+BPA.soup <- BPA.sc$soupProfile
+BPA.soup <- BPA.soup[BPA.soup$counts > 1000, ]
+BPA.soup$gene <- rownames(BPA.soup)
+lapply(markers_list, function(x) anti_join(x, BPA.soup, by = "gene"))
+
+export_list(markers_list)
+```
+
+
+## Differential expression in bulk cell types
+The groupings of cell types here were chosen to mimic how cells were sorted in our previous bulk RNA-seq experiment (ML and LP not separated out)
+```{r}
+# Find DEGs
+DefaultAssay(adult) <- "RNA"
+fib.degs <- FindMarkers(object = adult,
+                        ident.1 = "Vehicle",
+                        ident.2 = "BPA",
+                        group.by = "treatment",
+                        subset.ident = c("Fibroblast 1", "Fibroblast 2", "Fibroblast 3"),
+                        logfc.threshold = 0.5,
+                        min.pct = 0.2,
+                        test.use = "MAST")
+fib.degs <- fib.degs[fib.degs$p_val_adj < 0.05, ]
+fib.degs$gene <- rownames(fib.degs)
+fib.degs <- anti_join(fib.degs, BPA.soup, by = "gene")
+
+lum.degs <- FindMarkers(object = adult,
+                        ident.1 = "Vehicle",
+                        ident.2 = "BPA",
+                        group.by = "treatment",
+                        subset.ident = c("Mature Luminal", "Luminal Progenitor"),
+                        logfc.threshold = 0.5,
+                        min.pct = 0.2,
+                        test.use = "MAST")
+lum.degs <- lum.degs[lum.degs$p_val_adj < 0.05, ]
+lum.degs$gene <- rownames(lum.degs)
+lum.degs <- anti_join(lum.degs, BPA.soup, by = "gene")
+
+bas.degs <- FindMarkers(object = adult,
+                        ident.1 = "Vehicle",
+                        ident.2 = "BPA",
+                        group.by = "treatment",
+                        subset.ident = c("Basal 1", "Basal 2"),
+                        logfc.threshold = 0.5,
+                        min.pct = 0.2,
+                        test.use = "MAST")
+bas.degs <- bas.degs[bas.degs$p_val_adj < 0.05, ]
+bas.degs$gene <- rownames(bas.degs)
+bas.degs <- anti_join(bas.degs, BPA.soup, by = "gene")
+
+# Compare DEGs with published DEGs from bulk RNA-seq - supplemental figure 1F
+bulk.fib <- read.csv("Fib_DEGs.csv")
+bulk.lum <- read.csv("Lum_DEGs.csv")
+bulk.bas <- read_csv("Bas_DEGs.csv")
+
+bulk.fib <- bulk.fib[abs(bulk.fib$log2.Fold_change.) > 0.4, ]
+bulk.fib <- bulk.fib[bulk.fib$p.value < 0.05, ]
+bulk.fib$gene <- bulk.fib$GeneNames
+
+bulk.lum <- bulk.lum[abs(bulk.lum$log2.Fold_change.) > 0.4, ]
+bulk.lum <- bulk.lum[bulk.lum$p.value < 0.05, ]
+bulk.lum$gene <- bulk.lum$GeneNames
+
+bulk.bas <- bulk.bas[abs(bulk.bas$`log2(Fold_change)`) > 0.4, ]
+bulk.bas <- bulk.bas[bulk.bas$`p-value` < 0.05, ]
+bulk.bas$gene <- bulk.bas$GeneNames
+
+fib.overlap <- semi_join(fib.degs, bulk.fib, by = "gene")
+bas.overlap <- semi_join(bas.degs, bulk.bas, by = "gene")
+lum.overlap <- semi_join(lum.degs, bulk.lum, by = "gene")
+```
+

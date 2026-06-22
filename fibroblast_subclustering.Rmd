@@ -1,0 +1,168 @@
+---
+title: "Subclustering Fibroblasts"
+author: "Jillian Poska"
+date: "2026-06-22"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Load required libraries
+```{r}
+library(hdf5r)
+library(Signac)
+library(Seurat)
+library(SeuratObject)
+library(tidyverse)
+library(dplyr)
+library(umap)
+library(glmGamPoi)
+library(SeuratWrappers)
+library(slingshot)
+
+set.seed(228)
+setwd("~/Multiome2")
+```
+
+## Subset and recluster fibroblasts
+```{r}
+# Subset based on fibroblast identity
+adult <- readRDS("RDS/Adult/adult_annotated_final_actually.rds")
+adult.fibro <- subset(x = adult, idents = c("Fibroblast 1", "Fibroblast 2", "Fibroblast 3"))
+remove(adult)
+
+# Recluster
+adult.fibro <- FindMultiModalNeighbors(adult.fibro, reduction.list = list("integrated.harmony", "integrated_lsi_atac"), dims.list = list(1:50, 2:50))
+adult.fibro <- RunUMAP(adult.fibro, nn.name = "weighted.nn", reduction.name = "umap", reduction.key = "wnnUMAP_")
+adult.fibro <- FindClusters(adult.fibro, graph.name = "wsnn", algorithm = 3, verbose = FALSE, resolution = 0.2)
+```
+
+## Annotate fibroblast sublusters
+Pi16 signature was taken from Buechler et al 2017
+```{r}
+# RNA markers - Figure 6B
+DefaultAssay(adult.fibro) <- "RNA"
+DefaultAssay(e18.mes) <- "RNA"
+adult_rna_markers <- FindAllMarkers(object = adult.fibro,
+                          min.pct = 0.3,
+                          only.pos = T,
+                          logfc.threshold = 0.5)
+adult_rna_markers <- adult_rna_markers[adult_rna_markers$p_val_adj < 0.05, ]
+heatmap_genes <- 
+  adult_rna_markers %>%
+  as.data.frame() %>%
+  group_by(cluster) %>% # group by cluster
+  slice_min(order_by = p_val_adj, 
+            n = 10,
+            with_ties = F)
+
+adult.fibro <-
+  ScaleData(object = adult.fibro,
+            assay = "RNA")
+
+DoHeatmap(adult.fibro, features = heatmap_genes$gene)
+
+# Determine Pi16 signature - Figure 6C
+pi16.sig <- read.csv("~/Multiome/Annotation/Pi16_signature.csv")
+pi16 <- list(pi16.sig$Gene)
+adult.fibro <- AddModuleScore(adult.fibro, features = pi16, name = "Pi16")
+
+VlnPlot(adult.fibro, features = "Pi161") +
+  labs(y = "Module Score", title = "Pi16 Module Score")
+```
+
+## Trajectory analysis using Slingshot
+```{r}
+# Convert Seurat object to SCE using WNN UMAP as the dimensional reduction
+fib.sce <- as.SingleCellExperiment(adult.fibro)
+reducedDim(fib.sce) <- Embeddings(adult.fibro, "wnn.umap") 
+fib.sce <- slingshot(fib.sce, reducedDim = "WNN.UMAP", clusterLabels = fib.sce$seurat_clusters, start.clus = 1)
+
+# Assign colors to each cluster based on their colors in the Seurat object
+identities <- levels(adult.fibro$seurat_clusters)
+defaultcolor <- hue_pal()(length(identities))
+
+# Plot Slingshot trajectory with lineages included - Figure 6A overlay
+plot(reducedDim(fib.sce), pch = 16, cex = 0.5, col = defaultcolor)
+lines(SlingshotDataSet(fib.sce), lwd = 2, type = 'lineages', col = 'black', show.constraints = TRUE)
+```
+
+## Plot distribution of fibroblast subtypes - Figure 6D
+```{r}
+df <- table(adult.fibro@active.ident, adult.fibro$treatment) %>%
+  as.data.frame() 
+
+df$Var2 <- factor(df$Var2, levels = c("Vehicle", "BPA"))
+
+myplot <- ggplot(data = df, aes(fill = Var1, y = Freq, x = Var2)) +
+  geom_bar(stat = "identity", position = "fill", color = "black") 
+myplot +
+  theme(panel.grid = element_line("white"),
+        panel.background = element_rect("white"),
+        axis.line = element_line("black", linewidth = 0.75),
+        axis.text.x.bottom = element_text(size = 12),
+        axis.text.y.left = element_text(size = 12),
+        axis.title.x = element_text(size = 14, face = "bold"),
+        axis.title.y.left = element_text(size = 14, face = "bold")) +
+  labs(x = "Treatment", y = "% cells", fill = "Cluster")
+```
+
+## Initial ATAC analysis of fibroblast subclusters
+```{r}
+# Coverage plot Sema3c enhancer - Figure 7A
+CoveragePlot(adult.fibro,
+             region = "chr5-17556830-17556980",
+             extend.upstream = 1000,
+             extend.downstream = 20000,
+             features = "Sema3c",
+             assay = "ATAC",
+             expression.assay = "RNA")
+
+# Determine ATAC markers of each subcluster - used for Figure 7B
+# Determine markers for each cell population
+DefaultAssay(adult.fibro) <- "ATAC"
+atac_markers <- FindAllMarkers(adult.fibro,
+               min.pct = 0.1,
+               only.pos = F)
+atac_markers <- atac_markers[atac_markers$p_val_adj < 0.05, ]
+atac_markers <- atac_markers %>%
+  distinct(gene, .keep_all = TRUE)
+
+
+# Get a list of ranges for each cluster
+range_list <- lapply(atac_markers, function(x) StringToGRanges(x$gene, sep = c("-", "-")))
+
+# Save ranges list as a bed file - overlap with bulk ATAC-seq DARs using mergePeaks
+export.bed(range_list[['0']], con = "ATAC/c0_all_regions.bed")
+export.bed(range_list[['1']], con = "ATAC/c1_all_regions.bed")
+export.bed(range_list[['2']], con = "ATAC/c2_all_regions.bed")
+export.bed(range_list[['3']], con = "ATAC/c3_all_regions.bed")
+export.bed(range_list[['4']], con = "ATAC/c4_all_regions.bed")
+
+# Find DARs for fibroblast subclusters - Figure 7C
+df <- table(adult.fibro@active.ident, adult.fibro$treatment) %>%
+  as.data.frame() %>%
+  pivot_wider(names_from = Var2,
+              values_from = Freq) %>%
+  as.data.frame()
+
+clusters <- df[df$Vehicle >= 3 & df$BPA >= 3, "Var1"] %>%
+  as.character()
+
+markers_list <- list()
+for (cell in clusters){
+  markers <- FindMarkers(object = adult.fibro,
+                         ident.1 = "Vehicle",
+                         ident.2 = "BPA",
+                         group.by = "treatment",
+                         subset.ident = cell,
+                         min.pct = 0.1,
+                         test.use = "LR")
+  filtered_markers <- markers[markers$p_val_adj < 0.05, ]
+  filtered_markers$gene <- rownames(filtered_markers)
+  markers_list[[cell]] <- filtered_markers
+}
+```
+
